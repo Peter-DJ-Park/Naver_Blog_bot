@@ -1,10 +1,10 @@
 """
-냉장고를 부탁해 레시피 - 네이버 블로그 자동 발행 프로그램 v3
+냉장고를 부탁해 레시피 - 네이버 블로그 자동 발행 프로그램 v4
 ────────────────────────────────────────────────────────────
 흐름:
   Step 1 : recipes.csv 에서 발행여부=N 인 첫 번째 행 읽기
-  Step 2 : 로컬 이미지를 imgBB 에 업로드 → 웹 URL 확보
-  Step 3 : OpenAI GPT-4o-mini 로 블로그 본문(HTML) 생성
+  Step 2 : imgBB 에 이미지 업로드 → 웹 URL 확보
+  Step 3 : Gemini API 로 블로그 본문(HTML) 생성
   Step 4 : 네이버 블로그 쿠키 기반 내부 API 로 포스트 발행
             ├─ 방법 A : 내부 REST API (JSON)
             └─ 방법 B : PostSave.naver 폼 POST (Fallback)
@@ -21,7 +21,7 @@ import time
 from pathlib import Path
 
 import requests
-from openai import OpenAI
+import google.generativeai as genai
 from dotenv import load_dotenv
 
 # ── 환경변수 로드 ─────────────────────────────────────────────────
@@ -30,10 +30,11 @@ load_dotenv()
 NAVER_COOKIE   = os.getenv("NAVER_COOKIE")       # 네이버 로그인 쿠키 전체 문자열
 NAVER_BLOG_ID  = os.getenv("NAVER_BLOG_ID")      # 블로그 아이디 (URL 영문 ID)
 IMGBB_API_KEY  = os.getenv("IMGBB_API_KEY")      # imgBB API Key
-OPENAI_KEY     = os.getenv("OPENAI_API_KEY")     # OpenAI API Key
+GEMINI_KEY     = os.getenv("GEMINI_API_KEY")     # Gemini API Key
 CSV_PATH       = os.getenv("CSV_PATH", "recipes.csv")
 
-client = OpenAI(api_key=OPENAI_KEY)
+genai.configure(api_key=GEMINI_KEY)
+gemini_model = genai.GenerativeModel("gemini-2.0-flash-lite")
 
 # ── requests 세션 공통 설정 ───────────────────────────────────────
 SESSION = requests.Session()
@@ -171,21 +172,20 @@ def upload_to_imgbb(local_path: str) -> str:
 
 
 # ════════════════════════════════════════════════════════════════
-# 3. OpenAI 블로그 본문 생성 (네이버 블로그 최적화 HTML)
+# 3. Gemini 블로그 본문 생성 (네이버 블로그 최적화 HTML)
 # ════════════════════════════════════════════════════════════════
 
-SYSTEM_PROMPT = """
+PROMPT_TEMPLATE = """
 너는 '냉장고를 부탁해' 레시피 전문 블로거이자 스타 셰프들의 열혈 팬이야.
 네이버 블로그에 바로 붙여넣을 수 있는 HTML 형식으로 포스팅을 작성해 줘.
-규칙:
+
+[출력 규칙]
 - 코드블록(```html 등) 없이 순수 HTML 태그만 출력해.
 - 외부 CSS / JS 없이 인라인 스타일만 사용해.
-- 네이버 블로그 에디터 호환을 위해 <div>, <p>, <img>, <ul>, <ol>, <h2>, <h3>, <span>, <a> 태그만 사용해.
+- 사용 가능한 태그: <div>, <p>, <img>, <ul>, <ol>, <h2>, <h3>, <span>, <a>
 - 전체를 <div> 하나로 감싸서 반환해.
 - 이모지를 적절히 사용해 가독성을 높여.
-"""
 
-USER_PROMPT_TEMPLATE = """
 [입력 데이터]
 - 셰프: {셰프이름} / 인스타: @{셰프인스타ID} / 프로필: {셰프프로필정보}
 - 요리: {요리이름}
@@ -246,8 +246,8 @@ USER_PROMPT_TEMPLATE = """
 """
 
 def generate_blog_content(row: dict, thumb: str, p1: str, p2: str) -> tuple[str, str]:
-    """GPT-4o-mini 로 포스트 제목과 HTML 본문 생성."""
-    prompt = USER_PROMPT_TEMPLATE.format(
+    """Gemini 로 포스트 제목과 HTML 본문 생성."""
+    prompt = PROMPT_TEMPLATE.format(
         셰프이름       = row["셰프이름"],
         셰프인스타ID   = row["셰프인스타ID"],
         셰프프로필정보 = row["셰프프로필정보"],
@@ -259,17 +259,15 @@ def generate_blog_content(row: dict, thumb: str, p1: str, p2: str) -> tuple[str,
         방송사진2URL   = p2,
     )
 
-    resp = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user",   "content": prompt},
-        ],
-        temperature=0.8,
-        max_tokens=3500,
+    resp = gemini_model.generate_content(
+        prompt,
+        generation_config=genai.GenerationConfig(
+            temperature=0.8,
+            max_output_tokens=3500,
+        ),
     )
 
-    html = resp.choices[0].message.content.strip()
+    html = resp.text.strip()
 
     # 코드펜스 잔재 제거
     html = re.sub(r"^```[a-z]*\n?", "", html)
@@ -394,7 +392,7 @@ def publish_to_naver_blog(title: str, html_content: str) -> str:
 
 def main():
     print("=" * 60)
-    print("  냉부해 레시피 네이버 블로그 자동 발행 v3")
+    print("  냉부해 레시피 네이버 블로그 자동 발행 v4 (Gemini)")
     print("=" * 60)
 
     # Step 1: 미발행 레시피 로드
