@@ -335,73 +335,92 @@ def publish_to_naver_blog(title: str, html_content: str) -> str:
 
         # ── 3. 제목 입력 ──────────────────────────────────────────
         print("[Selenium] 제목 입력 중...")
+        time.sleep(3)  # 에디터 완전 로드 대기
+
+        # 스마트에디터 ONE 제목 영역: contenteditable div
         title_selectors = [
-            "input.se-title-input",
-            "input[placeholder*='제목']",
-            ".title_input",
             "div.se-title-text",
-            "[contenteditable='true'][class*='title']",
+            "div[contenteditable='true'][class*='title']",
+            ".se-section-title div[contenteditable='true']",
+            "div[contenteditable='true']",  # 첫 번째 contenteditable = 제목
         ]
         title_input = None
         for selector in title_selectors:
             try:
-                title_input = wait.until(
-                    EC.presence_of_element_located((By.CSS_SELECTOR, selector))
-                )
-                break
-            except TimeoutException:
+                elements = driver.find_elements(By.CSS_SELECTOR, selector)
+                for el in elements:
+                    if el.is_displayed():
+                        title_input = el
+                        break
+                if title_input:
+                    print(f"[Selenium] 제목창 발견: {selector}")
+                    break
+            except Exception:
                 continue
 
         if title_input:
-            title_input.click()
+            # JavaScript 로 클릭 및 텍스트 입력 (element not interactable 우회)
+            driver.execute_script("arguments[0].click();", title_input)
             time.sleep(0.5)
-            title_input.send_keys(title)
+            driver.execute_script(
+                "arguments[0].innerText = arguments[1];", title_input, title
+            )
+            # 커서를 끝으로 이동
+            driver.execute_script(
+                """
+                var el = arguments[0];
+                var range = document.createRange();
+                var sel = window.getSelection();
+                range.selectNodeContents(el);
+                range.collapse(false);
+                sel.removeAllRanges();
+                sel.addRange(range);
+                """,
+                title_input,
+            )
             print(f"[Selenium] 제목 입력 완료: {title}")
         else:
             print("[WARN] 제목 입력창을 찾지 못했습니다.")
 
         time.sleep(1)
 
-        # ── 4. 본문 입력 (JavaScript inject 방식) ────────────────
+        # ── 4. 본문 입력 (iframe body 방식) ──────────────────────
         print("[Selenium] 본문 입력 중...")
-
-        # 스마트에디터 ONE 의 contenteditable 영역 탐색
-        body_selectors = [
-            ".se-content",
-            "div[contenteditable='true'].se-component-content",
-            ".se-main-container",
-            "div[contenteditable='true']",
-        ]
-
-        body_input = None
-        for selector in body_selectors:
-            try:
-                elements = driver.find_elements(By.CSS_SELECTOR, selector)
-                for el in elements:
-                    if el.is_displayed():
-                        body_input = el
-                        break
-                if body_input:
+        try:
+            # iframe 탐색
+            iframes = driver.find_elements(By.TAG_NAME, "iframe")
+            editor_iframe = None
+            for fr in iframes:
+                if fr.is_displayed() and fr.size.get("width", 0) > 100:
+                    editor_iframe = fr
                     break
-            except Exception:
-                continue
+            # 작은 iframe 도 포함해서 재시도
+            if not editor_iframe and iframes:
+                editor_iframe = iframes[0]
 
-        if body_input:
-            # JavaScript 로 HTML 직접 삽입
-            driver.execute_script(
-                """
-                var editor = arguments[0];
-                editor.focus();
-                document.execCommand('selectAll', false, null);
-                document.execCommand('delete', false, null);
-                document.execCommand('insertHTML', false, arguments[1]);
-                """,
-                body_input,
-                html_content,
-            )
-            print("[Selenium] 본문 입력 완료 (JavaScript inject)")
-        else:
-            print("[WARN] 본문 입력창을 찾지 못했습니다.")
+            if editor_iframe:
+                driver.switch_to.frame(editor_iframe)
+                body = driver.find_element(By.TAG_NAME, "body")
+                # 기존 내용 삭제 후 HTML 삽입
+                driver.execute_script(
+                    """
+                    var body = arguments[0];
+                    body.focus();
+                    body.innerHTML = arguments[1];
+                    body.dispatchEvent(new Event('input', {bubbles: true}));
+                    body.dispatchEvent(new Event('change', {bubbles: true}));
+                    """,
+                    body,
+                    html_content,
+                )
+                print("[Selenium] 본문 입력 완료 (iframe body)")
+                driver.switch_to.default_content()
+                time.sleep(1)
+            else:
+                print("[WARN] 본문 iframe 을 찾지 못했습니다.")
+        except Exception as e:
+            print(f"[WARN] 본문 입력 오류: {e}")
+            driver.switch_to.default_content()
 
         time.sleep(2)
 
