@@ -1,16 +1,19 @@
 """
-냉장고를 부탁해 레시피 - 네이버 블로그 자동 발행 프로그램 v5
+냉장고를 부탁해 레시피 - 네이버 블로그 자동 발행 프로그램 v6
 ────────────────────────────────────────────────────────────
 흐름:
   Step 1 : recipes.csv 에서 발행여부=N 인 첫 번째 행 읽기
-  Step 2 : imgBB 에 이미지 업로드 → 웹 URL 확보
+  Step 2 : imgBB URL 확인 (image_collector 로 미리 수집된 URL 재사용)
   Step 3 : Groq API (llama-3.3-70b) 로 블로그 본문(HTML) 생성
-  Step 4 : 네이버 블로그 쿠키 기반 내부 API 로 포스트 발행
-            ├─ 방법 A : 내부 REST API (JSON)
-            └─ 방법 B : PostSave.naver 폼 POST (Fallback)
+  Step 4 : Selenium 으로 네이버 블로그 자동 발행
+            ├─ 쿠키 주입으로 로그인 처리
+            ├─ 글쓰기 페이지 접속
+            ├─ 제목 / 본문 입력
+            └─ 발행 버튼 클릭
   Step 5 : CSV 발행여부 → Y 업데이트
 
-※ 쿠키 추출 방법 및 imgBB API 키 발급은 README.md 참고
+※ 최초 실행 시 크롬 브라우저가 자동으로 열립니다.
+※ 쿠키 추출 방법은 README.md 참고
 """
 
 import os
@@ -18,82 +21,54 @@ import csv
 import re
 import base64
 import time
+import json
 from pathlib import Path
 
 import requests
 from groq import Groq
 from dotenv import load_dotenv
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.common.by import By
+from selenium.webdriver.common.keys import Keys
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.common.exceptions import TimeoutException, NoSuchElementException
+from webdriver_manager.chrome import ChromeDriverManager
 
 # ── 환경변수 로드 ─────────────────────────────────────────────────
 load_dotenv()
 
-NAVER_COOKIE   = os.getenv("NAVER_COOKIE")       # 네이버 로그인 쿠키 전체 문자열
-NAVER_BLOG_ID  = os.getenv("NAVER_BLOG_ID")      # 블로그 아이디 (URL 영문 ID)
-IMGBB_API_KEY  = os.getenv("IMGBB_API_KEY")      # imgBB API Key
-GROQ_KEY       = os.getenv("GROQ_API_KEY")       # Groq API Key
-CSV_PATH       = os.getenv("CSV_PATH", "recipes.csv")
+NAVER_COOKIE  = os.getenv("NAVER_COOKIE")       # 네이버 로그인 쿠키 전체 문자열
+NAVER_BLOG_ID = os.getenv("NAVER_BLOG_ID")      # 블로그 아이디 (URL 영문 ID)
+IMGBB_API_KEY = os.getenv("IMGBB_API_KEY")      # imgBB API Key
+GROQ_KEY      = os.getenv("GROQ_API_KEY")       # Groq API Key
+CSV_PATH      = os.getenv("CSV_PATH", "recipes.csv")
 
 groq_client = Groq(api_key=GROQ_KEY)
 
-# ── requests 세션 공통 설정 ───────────────────────────────────────
-SESSION = requests.Session()
-SESSION.headers.update({
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/125.0.0.0 Safari/537.36"
-    ),
-    "Cookie": NAVER_COOKIE,
-})
-
 
 # ════════════════════════════════════════════════════════════════
-# 유틸: 네이버 쿠키 유효성 확인
+# 유틸: 쿠키 문자열 → 딕셔너리 리스트 변환
 # ════════════════════════════════════════════════════════════════
 
-def check_cookie_valid() -> bool:
-    """로그인 상태 확인. 유효하면 True, 만료됐으면 False."""
-    try:
-        resp = SESSION.get(
-            f"https://blog.naver.com/PostWriteForm.naver?blogId={NAVER_BLOG_ID}",
-            timeout=15,
-            allow_redirects=True,
-        )
-        if "nid.naver.com/nidlogin" in resp.url or "로그인" in resp.text[:500]:
-            return False
-        return True
-    except Exception:
-        return False
-
-
-# ════════════════════════════════════════════════════════════════
-# 유틸: CSRF 토큰 추출
-# ════════════════════════════════════════════════════════════════
-
-def get_csrf_token() -> str:
-    """네이버 글쓰기 폼에서 CSRF 토큰 추출. 5가지 패턴 순서대로 시도."""
-    resp = SESSION.get(
-        f"https://blog.naver.com/PostWriteForm.naver?blogId={NAVER_BLOG_ID}",
-        timeout=15,
-    )
-    html = resp.text
-
-    patterns = [
-        r'name=["\']_csrf["\'][^>]*value=["\']([^"\']+)["\']',
-        r'value=["\']([^"\']+)["\'][^>]*name=["\']_csrf["\']',
-        r'"_csrf"\s*:\s*"([^"]+)"',
-        r'"token"\s*:\s*"([^"]+)"',
-        r"csrf['\"]?\s*[:=]\s*['\"]([^'\"]{10,})['\"]",
-    ]
-    for pattern in patterns:
-        m = re.search(pattern, html, re.IGNORECASE)
-        if m:
-            token = m.group(1)
-            print(f"[CSRF] 토큰 추출 성공: {token[:10]}...")
-            return token
-
-    print("[WARN] CSRF 토큰 추출 실패 — 쿠키 만료 가능성 있음")
-    return ""
+def parse_cookies(cookie_str: str) -> list[dict]:
+    """
+    'key=value; key2=value2' 형태의 쿠키 문자열을
+    Selenium add_cookie() 에 맞는 딕셔너리 리스트로 변환.
+    """
+    cookies = []
+    for part in cookie_str.split(";"):
+        part = part.strip()
+        if "=" in part:
+            key, _, value = part.partition("=")
+            cookies.append({
+                "name":   key.strip(),
+                "value":  value.strip(),
+                "domain": ".naver.com",
+            })
+    return cookies
 
 
 # ════════════════════════════════════════════════════════════════
@@ -134,18 +109,17 @@ def mark_as_published(csv_path: str, target_id: str) -> None:
 
 
 # ════════════════════════════════════════════════════════════════
-# 2. imgBB 이미지 업로드
+# 2. imgBB 이미지 처리
 # ════════════════════════════════════════════════════════════════
 
 def upload_to_imgbb(local_path: str) -> str:
     """
-    로컬 이미지를 imgBB 에 업로드 후 직접 링크(URL) 반환.
-    이미 웹 URL 이면 그대로 반환 (image_collector 가 미리 업로드한 경우).
-    실패 시 빈 문자열 반환.
+    이미 웹 URL 이면 그대로 반환.
+    로컬 경로면 imgBB 에 업로드 후 URL 반환.
     """
     local_path = local_path.strip()
 
-    # 이미 웹 URL 이면 업로드 없이 그대로 사용
+    # 이미 웹 URL 이면 그대로 사용
     if local_path.startswith("http://") or local_path.startswith("https://"):
         print(f"[imgBB] URL 그대로 사용: {local_path[:60]}")
         return local_path
@@ -159,10 +133,7 @@ def upload_to_imgbb(local_path: str) -> str:
 
     resp = requests.post(
         "https://api.imgbb.com/1/upload",
-        data={
-            "key":   IMGBB_API_KEY,
-            "image": image_data,
-        },
+        data={"key": IMGBB_API_KEY, "image": image_data},
         timeout=30,
     )
     resp.raise_for_status()
@@ -178,7 +149,7 @@ def upload_to_imgbb(local_path: str) -> str:
 
 
 # ════════════════════════════════════════════════════════════════
-# 3. Groq 블로그 본문 생성 (네이버 블로그 최적화 HTML)
+# 3. Groq 블로그 본문 생성
 # ════════════════════════════════════════════════════════════════
 
 PROMPT_TEMPLATE = """
@@ -284,10 +255,8 @@ def generate_blog_content(row: dict, thumb: str, p1: str, p2: str) -> tuple[str,
     )
 
     html = resp.choices[0].message.content.strip()
-
-    # 코드펜스 잔재 제거
     html = re.sub(r"^```[a-z]*\n?", "", html)
-    html = re.sub(r"\n?```$",       "", html)
+    html = re.sub(r"\n?```$", "", html)
 
     title = f"[냉부해] {row['셰프이름']} 셰프의 {row['요리이름']} 레시피"
     print(f"[AI] 본문 생성 완료 | 제목: {title}")
@@ -295,111 +264,247 @@ def generate_blog_content(row: dict, thumb: str, p1: str, p2: str) -> tuple[str,
 
 
 # ════════════════════════════════════════════════════════════════
-# 4. 네이버 블로그 발행 (방법 A → B Fallback)
+# 4. Selenium 네이버 블로그 발행
 # ════════════════════════════════════════════════════════════════
 
-def _try_method_a(title: str, html: str, csrf: str) -> str:
-    """방법 A: 네이버 블로그 내부 REST API (JSON)"""
-    endpoint = f"https://blog.naver.com/api/blogs/{NAVER_BLOG_ID}/posts"
-    headers = {
-        "Content-Type":     "application/json; charset=UTF-8",
-        "X-Requested-With": "XMLHttpRequest",
-        "X-CSRF-Token":     csrf,
-        "Referer": f"https://blog.naver.com/PostWriteForm.naver?blogId={NAVER_BLOG_ID}",
-    }
-    payload = {
-        "title":         title,
-        "contents":      html,
-        "categoryNo":    "0",
-        "tagList":       "냉장고를부탁해,냉부해레시피,요리,초간단요리",
-        "publishMoment": "PUBLIC",
-        "addContents":   "",
-    }
-    try:
-        resp   = SESSION.post(endpoint, headers=headers, json=payload, timeout=30)
-        data   = resp.json()
-        log_no = (data.get("logNo")
-                  or data.get("result", {}).get("logNo", "")
-                  or data.get("data",   {}).get("logNo", ""))
-        if log_no:
-            url = f"https://blog.naver.com/{NAVER_BLOG_ID}/{log_no}"
-            print(f"[방법A] 발행 성공 | logNo={log_no}")
-            return url
-        print(f"[방법A] logNo 없음: {str(data)[:200]}")
-    except Exception as e:
-        print(f"[방법A] 실패: {e}")
-    return ""
+def create_driver() -> webdriver.Chrome:
+    """Chrome 드라이버 생성 (headless 옵션 없음 — 화면 표시)."""
+    options = Options()
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
+    options.add_argument("--disable-blink-features=AutomationControlled")
+    options.add_experimental_option("excludeSwitches", ["enable-automation"])
+    options.add_experimental_option("useAutomationExtension", False)
+    options.add_argument(
+        "user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/125.0.0.0 Safari/537.36"
+    )
+
+    service = Service(ChromeDriverManager().install())
+    driver  = webdriver.Chrome(service=service, options=options)
+    driver.execute_script(
+        "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
+    )
+    return driver
 
 
-def _try_method_b(title: str, html: str, csrf: str) -> str:
-    """방법 B: PostSave.naver 폼 POST (Fallback)"""
-    endpoint = "https://blog.naver.com/PostSave.naver"
-    headers = {
-        "Content-Type":     "application/x-www-form-urlencoded; charset=UTF-8",
-        "X-Requested-With": "XMLHttpRequest",
-        "Referer": f"https://blog.naver.com/PostWriteForm.naver?blogId={NAVER_BLOG_ID}",
-    }
-    payload = {
-        "blogId":        NAVER_BLOG_ID,
-        "title":         title,
-        "body":          html,
-        "categoryNo":    "0",
-        "tag":           "냉장고를부탁해,냉부해레시피",
-        "publishMoment": "PUBLIC",
-        "outUrl":        "",
-        "keepPost":      "N",
-        "_csrf":         csrf,
-    }
-    try:
-        resp   = SESSION.post(endpoint, headers=headers, data=payload, timeout=30)
-        data   = resp.json()
-        log_no = data.get("logNo", "")
-        if log_no:
-            url = f"https://blog.naver.com/{NAVER_BLOG_ID}/{log_no}"
-            print(f"[방법B] 발행 성공 | logNo={log_no}")
-            return url
-        print(f"[방법B] logNo 없음: {str(data)[:200]}")
-    except Exception as e:
-        print(f"[방법B] 실패: {e}")
-    return ""
+def inject_naver_cookies(driver: webdriver.Chrome) -> None:
+    """
+    네이버 쿠키를 Selenium 세션에 주입합니다.
+    쿠키 주입 전 반드시 naver.com 에 먼저 접속해야 합니다.
+    """
+    driver.get("https://www.naver.com")
+    time.sleep(2)
+
+    cookies = parse_cookies(NAVER_COOKIE)
+    for cookie in cookies:
+        try:
+            driver.add_cookie(cookie)
+        except Exception:
+            pass  # 일부 쿠키 주입 실패는 무시
+
+    print(f"[Selenium] 쿠키 {len(cookies)}개 주입 완료")
 
 
 def publish_to_naver_blog(title: str, html_content: str) -> str:
     """
-    네이버 블로그에 포스트를 발행합니다.
-    방법 A → 방법 B 순서로 Fallback 시도.
+    Selenium 으로 네이버 블로그 스마트에디터 ONE 에 포스트를 발행합니다.
+    성공 시 발행된 포스트 URL 반환.
     """
-    # 쿠키 유효성 사전 확인
-    if not check_cookie_valid():
-        print()
-        print("=" * 60)
-        print("  ❌ 네이버 쿠키가 만료되었습니다.")
-        print()
-        print("  재추출 방법:")
-        print("  1. 크롬에서 blog.naver.com 로그인")
-        print("  2. F12 → Network 탭")
-        print("  3. 임의 요청 클릭 → Request Headers → Cookie 전체 복사")
-        print("  4. .env 의 NAVER_COOKIE 값 업데이트 후 재실행")
-        print("=" * 60)
-        return ""
+    driver = create_driver()
+    wait   = WebDriverWait(driver, 20)
+    post_url = ""
 
-    csrf = get_csrf_token()
+    try:
+        # ── 1. 쿠키 주입으로 로그인 ───────────────────────────────
+        print("[Selenium] 쿠키 주입 중...")
+        inject_naver_cookies(driver)
 
-    print("[발행] 방법 A 시도 중...")
-    result = _try_method_a(title, html_content, csrf)
-    if result:
-        return result
+        # ── 2. 글쓰기 페이지 접속 ────────────────────────────────
+        print("[Selenium] 글쓰기 페이지 접속 중...")
+        driver.get(f"https://blog.naver.com/{NAVER_BLOG_ID}/postwrite")
+        time.sleep(4)
 
-    time.sleep(1)
-    print("[발행] 방법 B 시도 중...")
-    result = _try_method_b(title, html_content, csrf)
-    if result:
-        return result
+        # 로그인 확인 (로그인 페이지로 리다이렉트됐으면 실패)
+        if "nid.naver.com" in driver.current_url:
+            print("[ERROR] 로그인 실패 — 쿠키를 재추출해 주세요.")
+            return ""
 
-    print("[ERROR] 방법 A, B 모두 실패했습니다.")
-    print("        네이버 내부 API 구조가 변경됐을 수 있습니다.")
-    print("        README.md 의 '발행 실패 시 대처법' 섹션을 참고하세요.")
-    return ""
+        print(f"[Selenium] 현재 URL: {driver.current_url}")
+
+        # ── 3. 제목 입력 ──────────────────────────────────────────
+        print("[Selenium] 제목 입력 중...")
+        title_selectors = [
+            "input.se-title-input",
+            "input[placeholder*='제목']",
+            ".title_input",
+            "div.se-title-text",
+            "[contenteditable='true'][class*='title']",
+        ]
+        title_input = None
+        for selector in title_selectors:
+            try:
+                title_input = wait.until(
+                    EC.presence_of_element_located((By.CSS_SELECTOR, selector))
+                )
+                break
+            except TimeoutException:
+                continue
+
+        if title_input:
+            title_input.click()
+            time.sleep(0.5)
+            title_input.send_keys(title)
+            print(f"[Selenium] 제목 입력 완료: {title}")
+        else:
+            print("[WARN] 제목 입력창을 찾지 못했습니다.")
+
+        time.sleep(1)
+
+        # ── 4. 본문 입력 (JavaScript inject 방식) ────────────────
+        print("[Selenium] 본문 입력 중...")
+
+        # 스마트에디터 ONE 의 contenteditable 영역 탐색
+        body_selectors = [
+            ".se-content",
+            "div[contenteditable='true'].se-component-content",
+            ".se-main-container",
+            "div[contenteditable='true']",
+        ]
+
+        body_input = None
+        for selector in body_selectors:
+            try:
+                elements = driver.find_elements(By.CSS_SELECTOR, selector)
+                for el in elements:
+                    if el.is_displayed():
+                        body_input = el
+                        break
+                if body_input:
+                    break
+            except Exception:
+                continue
+
+        if body_input:
+            # JavaScript 로 HTML 직접 삽입
+            driver.execute_script(
+                """
+                var editor = arguments[0];
+                editor.focus();
+                document.execCommand('selectAll', false, null);
+                document.execCommand('delete', false, null);
+                document.execCommand('insertHTML', false, arguments[1]);
+                """,
+                body_input,
+                html_content,
+            )
+            print("[Selenium] 본문 입력 완료 (JavaScript inject)")
+        else:
+            print("[WARN] 본문 입력창을 찾지 못했습니다.")
+
+        time.sleep(2)
+
+        # ── 5. 발행 버튼 클릭 ────────────────────────────────────
+        print("[Selenium] 발행 버튼 클릭 중...")
+        publish_selectors = [
+            "button.publish_btn__m9KHH",
+            "button[class*='publish']",
+            "button[class*='save_btn']",
+            "button.confirm_btn",
+            "//button[contains(text(), '발행')]",
+            "//button[contains(text(), '등록')]",
+            "//button[contains(text(), '공개발행')]",
+        ]
+
+        published = False
+        for selector in publish_selectors:
+            try:
+                if selector.startswith("//"):
+                    btn = wait.until(
+                        EC.element_to_be_clickable((By.XPATH, selector))
+                    )
+                else:
+                    btn = wait.until(
+                        EC.element_to_be_clickable((By.CSS_SELECTOR, selector))
+                    )
+                btn.click()
+                print(f"[Selenium] 발행 버튼 클릭: {selector}")
+                published = True
+                break
+            except TimeoutException:
+                continue
+
+        if not published:
+            print("[WARN] 발행 버튼을 찾지 못했습니다. 수동으로 발행해 주세요.")
+            input("발행 완료 후 Enter 키를 누르세요...")
+
+        time.sleep(3)
+
+        # ── 6. 발행 확인 팝업 처리 (있는 경우) ───────────────────
+        confirm_selectors = [
+            "button.confirm_btn__WEaBq",
+            "button[class*='confirm']",
+            "//button[contains(text(), '확인')]",
+            "//button[contains(text(), '공개발행')]",
+            "//button[contains(text(), '발행하기')]",
+        ]
+        for selector in confirm_selectors:
+            try:
+                if selector.startswith("//"):
+                    btn = WebDriverWait(driver, 5).until(
+                        EC.element_to_be_clickable((By.XPATH, selector))
+                    )
+                else:
+                    btn = WebDriverWait(driver, 5).until(
+                        EC.element_to_be_clickable((By.CSS_SELECTOR, selector))
+                    )
+                btn.click()
+                print(f"[Selenium] 확인 버튼 클릭: {selector}")
+                break
+            except TimeoutException:
+                continue
+
+        time.sleep(4)
+
+        # ── 7. 발행된 URL 확인 ───────────────────────────────────
+        current_url = driver.current_url
+        print(f"[Selenium] 발행 후 URL: {current_url}")
+
+        if NAVER_BLOG_ID in current_url and "postwrite" not in current_url:
+            post_url = current_url
+        else:
+            # URL 에서 logNo 추출 시도
+            m = re.search(r"logNo=(\d+)", current_url)
+            if m:
+                post_url = f"https://blog.naver.com/{NAVER_BLOG_ID}/{m.group(1)}"
+            else:
+                # 페이지 내 링크에서 발행된 포스트 URL 탐색
+                try:
+                    links = driver.find_elements(By.CSS_SELECTOR, "a[href*='blog.naver.com']")
+                    for link in links:
+                        href = link.get_attribute("href") or ""
+                        if NAVER_BLOG_ID in href and re.search(r"/\d+$", href):
+                            post_url = href
+                            break
+                except Exception:
+                    pass
+
+        if post_url:
+            print(f"[Selenium] 발행 성공 | URL: {post_url}")
+        else:
+            print("[WARN] 발행 URL 확인 불가 — 블로그에서 직접 확인해 주세요.")
+            post_url = f"https://blog.naver.com/{NAVER_BLOG_ID}"
+
+    except Exception as e:
+        print(f"[ERROR] Selenium 발행 중 오류: {e}")
+
+    finally:
+        time.sleep(2)
+        driver.quit()
+        print("[Selenium] 브라우저 종료")
+
+    return post_url
 
 
 # ════════════════════════════════════════════════════════════════
@@ -408,7 +513,7 @@ def publish_to_naver_blog(title: str, html_content: str) -> str:
 
 def main():
     print("=" * 60)
-    print("  냉부해 레시피 네이버 블로그 자동 발행 v5 (Groq)")
+    print("  냉부해 레시피 네이버 블로그 자동 발행 v6 (Selenium)")
     print("=" * 60)
 
     # Step 1: 미발행 레시피 로드
@@ -418,8 +523,8 @@ def main():
         return
     print(f"[STEP 1] 로드 완료 | ID={row['요리ID']} | {row['셰프이름']} - {row['요리이름']}")
 
-    # Step 2: imgBB 이미지 업로드
-    print("[STEP 2] imgBB 이미지 업로드 중...")
+    # Step 2: 이미지 URL 확인
+    print("[STEP 2] 이미지 URL 확인 중...")
     thumb_url = upload_to_imgbb(row["썸네일사진경로"])
     p1_url    = upload_to_imgbb(row["방송사진1경로"])
     p2_url    = upload_to_imgbb(row["방송사진2경로"])
@@ -428,8 +533,9 @@ def main():
     print("[STEP 3] AI 블로그 본문 생성 중...")
     title, html = generate_blog_content(row, thumb_url, p1_url, p2_url)
 
-    # Step 4: 네이버 블로그 발행
-    print("[STEP 4] 네이버 블로그 발행 중...")
+    # Step 4: Selenium 으로 발행
+    print("[STEP 4] Selenium 으로 네이버 블로그 발행 중...")
+    print("         ※ 크롬 브라우저가 자동으로 열립니다.")
     post_url = publish_to_naver_blog(title, html)
 
     # Step 5: CSV 업데이트
