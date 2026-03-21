@@ -140,9 +140,16 @@ def mark_as_published(csv_path: str, target_id: str) -> None:
 def upload_to_imgbb(local_path: str) -> str:
     """
     로컬 이미지를 imgBB 에 업로드 후 직접 링크(URL) 반환.
+    이미 웹 URL 이면 그대로 반환 (image_collector 가 미리 업로드한 경우).
     실패 시 빈 문자열 반환.
     """
     local_path = local_path.strip()
+
+    # 이미 웹 URL 이면 업로드 없이 그대로 사용
+    if local_path.startswith("http://") or local_path.startswith("https://"):
+        print(f"[imgBB] URL 그대로 사용: {local_path[:60]}")
+        return local_path
+
     if not local_path or not Path(local_path).exists():
         print(f"[WARN] 이미지 없음: '{local_path}'")
         return ""
@@ -276,7 +283,6 @@ def generate_blog_content(row: dict, thumb: str, p1: str, p2: str) -> tuple[str,
         max_tokens=3500,
     )
 
-    # Groq API의 응답 구조에 맞게 수정됨
     html = resp.choices[0].message.content.strip()
 
     # 코드펜스 잔재 제거
@@ -294,12 +300,12 @@ def generate_blog_content(row: dict, thumb: str, p1: str, p2: str) -> tuple[str,
 
 def _try_method_a(title: str, html: str, csrf: str) -> str:
     """방법 A: 네이버 블로그 내부 REST API (JSON)"""
-    endpoint = f"[https://blog.naver.com/api/blogs/](https://blog.naver.com/api/blogs/){NAVER_BLOG_ID}/posts"
+    endpoint = f"https://blog.naver.com/api/blogs/{NAVER_BLOG_ID}/posts"
     headers = {
         "Content-Type":     "application/json; charset=UTF-8",
         "X-Requested-With": "XMLHttpRequest",
         "X-CSRF-Token":     csrf,
-        "Referer": f"[https://blog.naver.com/PostWriteForm.naver?blogId=](https://blog.naver.com/PostWriteForm.naver?blogId=){NAVER_BLOG_ID}",
+        "Referer": f"https://blog.naver.com/PostWriteForm.naver?blogId={NAVER_BLOG_ID}",
     }
     payload = {
         "title":         title,
@@ -316,7 +322,7 @@ def _try_method_a(title: str, html: str, csrf: str) -> str:
                   or data.get("result", {}).get("logNo", "")
                   or data.get("data",   {}).get("logNo", ""))
         if log_no:
-            url = f"[https://blog.naver.com/](https://blog.naver.com/){NAVER_BLOG_ID}/{log_no}"
+            url = f"https://blog.naver.com/{NAVER_BLOG_ID}/{log_no}"
             print(f"[방법A] 발행 성공 | logNo={log_no}")
             return url
         print(f"[방법A] logNo 없음: {str(data)[:200]}")
@@ -327,11 +333,11 @@ def _try_method_a(title: str, html: str, csrf: str) -> str:
 
 def _try_method_b(title: str, html: str, csrf: str) -> str:
     """방법 B: PostSave.naver 폼 POST (Fallback)"""
-    endpoint = "[https://blog.naver.com/PostSave.naver](https://blog.naver.com/PostSave.naver)"
+    endpoint = "https://blog.naver.com/PostSave.naver"
     headers = {
         "Content-Type":     "application/x-www-form-urlencoded; charset=UTF-8",
         "X-Requested-With": "XMLHttpRequest",
-        "Referer": f"[https://blog.naver.com/PostWriteForm.naver?blogId=](https://blog.naver.com/PostWriteForm.naver?blogId=){NAVER_BLOG_ID}",
+        "Referer": f"https://blog.naver.com/PostWriteForm.naver?blogId={NAVER_BLOG_ID}",
     }
     payload = {
         "blogId":        NAVER_BLOG_ID,
@@ -349,7 +355,7 @@ def _try_method_b(title: str, html: str, csrf: str) -> str:
         data   = resp.json()
         log_no = data.get("logNo", "")
         if log_no:
-            url = f"[https://blog.naver.com/](https://blog.naver.com/){NAVER_BLOG_ID}/{log_no}"
+            url = f"https://blog.naver.com/{NAVER_BLOG_ID}/{log_no}"
             print(f"[방법B] 발행 성공 | logNo={log_no}")
             return url
         print(f"[방법B] logNo 없음: {str(data)[:200]}")
